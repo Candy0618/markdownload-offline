@@ -332,7 +332,10 @@ async function convertArticleToMarkdown(article, downloadImages = null) {
     options.frontmatter = options.backmatter = '';
   }
 
-  options.imagePrefix = textReplace(options.imagePrefix, article, options.disallowedChars)
+  const resolvedImagePrefix = (options.downloadImages && options.downloadMode === 'downloadsApi')
+    ? 'images/'
+    : options.imagePrefix;
+  options.imagePrefix = textReplace(resolvedImagePrefix, article, options.disallowedChars)
     .split('/').map(s=>generateValidFileName(s, options.disallowedChars)).join('/');
 
   let result = turndown(article.content, options, article);
@@ -394,17 +397,29 @@ async function preDownloadImages(imageList, markdown) {
           else {
 
             let newFilename = filename;
-            if (newFilename.endsWith('.idunno')) {
-              // replace any unknown extension with a lookup based on mime type
-              newFilename = filename.replace('.idunno', '.' + mimedb[blob.type]);
-
-              // and replace any instances of this in the markdown
-              // remember to url encode for replacement if it's not an obsidian link
+            const applyFilenameUpdate = (updatedFilename) => {
               if (!options.imageStyle.startsWith("obsidian")) {
-                markdown = markdown.replaceAll(filename.split('/').map(s => encodeURI(s)).join('/'), newFilename.split('/').map(s => encodeURI(s)).join('/'))
+                markdown = markdown.replaceAll(
+                  newFilename.split('/').map(s => encodeURI(s)).join('/'),
+                  updatedFilename.split('/').map(s => encodeURI(s)).join('/')
+                );
               }
               else {
-                markdown = markdown.replaceAll(filename, newFilename)
+                markdown = markdown.replaceAll(newFilename, updatedFilename);
+              }
+              newFilename = updatedFilename;
+            };
+
+            const mimeExt = mimedb[blob.type];
+            const extStart = newFilename.lastIndexOf('.');
+            const currentExt = extStart >= 0 ? newFilename.substring(extStart + 1) : '';
+
+            if (mimeExt) {
+              if (currentExt === 'idunno') {
+                applyFilenameUpdate(newFilename.replace('.idunno', '.' + mimeExt));
+              }
+              else if (currentExt && currentExt.toLowerCase() !== mimeExt.toLowerCase()) {
+                applyFilenameUpdate(`${newFilename.substring(0, extStart + 1)}${mimeExt}`);
               }
             }
 
@@ -444,10 +459,17 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
     try {
 
       if(mdClipsFolder && !mdClipsFolder.endsWith('/')) mdClipsFolder += '/';
+      const titleLeaf = title.substring(title.lastIndexOf('/') + 1);
+      const baseFolder = options.downloadImages
+        ? `${mdClipsFolder}${title}${title.endsWith('/') ? '' : '/'}`
+        : mdClipsFolder;
+      const markdownFilename = options.downloadImages
+        ? `${baseFolder}${titleLeaf}.md`
+        : `${mdClipsFolder}${title}.md`;
       // start the download
       const id = await browser.downloads.download({
         url: url,
-        filename: mdClipsFolder + title + ".md",
+        filename: markdownFilename,
         saveAs: options.saveAs
       });
 
@@ -456,15 +478,13 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
 
       // download images (if enabled)
       if (options.downloadImages) {
-        // get the relative path of the markdown file (if any) for image path
-        let destPath = mdClipsFolder + title.substring(0, title.lastIndexOf('/'));
-        if(destPath && !destPath.endsWith('/')) destPath += '/';
         Object.entries(imageList).forEach(async ([src, filename]) => {
+          const normalizedFilename = filename.startsWith('images/') ? filename : `images/${filename}`;
           // start the download of the image
           const imgId = await browser.downloads.download({
             url: src,
             // set a destination path (relative to md file)
-            filename: destPath ? destPath + filename : filename,
+            filename: `${baseFolder}${normalizedFilename}`,
             saveAs: false
           })
           // add a listener (so we can release the blob url)
