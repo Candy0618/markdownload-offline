@@ -9,6 +9,71 @@ browser.runtime.onMessage.addListener(notify);
 // create context menus
 createMenus()
 
+const imageRequestRefererByUrl = new Map();
+
+function registerImageRequestReferer(url, referer) {
+  if (!url || !referer) return;
+  const current = imageRequestRefererByUrl.get(url);
+  if (current) {
+    current.count += 1;
+    current.referer = referer;
+  }
+  else {
+    imageRequestRefererByUrl.set(url, { referer, count: 1 });
+  }
+}
+
+function unregisterImageRequestReferer(url) {
+  if (!url) return;
+  const current = imageRequestRefererByUrl.get(url);
+  if (!current) return;
+
+  current.count -= 1;
+  if (current.count <= 0) {
+    imageRequestRefererByUrl.delete(url);
+  }
+}
+
+function upsertHeader(headers, name, value) {
+  const index = headers.findIndex(h => h.name && h.name.toLowerCase() === name.toLowerCase());
+  if (index >= 0) headers[index].value = value;
+  else headers.push({ name, value });
+}
+
+function injectRefererHeaders(details) {
+  const tracked = imageRequestRefererByUrl.get(details.url);
+  if (!tracked || !tracked.referer) return {};
+
+  const requestHeaders = details.requestHeaders || [];
+  upsertHeader(requestHeaders, 'Referer', tracked.referer);
+
+  try {
+    const origin = new URL(tracked.referer).origin;
+    if (origin) upsertHeader(requestHeaders, 'Origin', origin);
+  }
+  catch (_) {}
+
+  return { requestHeaders };
+}
+
+if (browser.webRequest?.onBeforeSendHeaders) {
+  const filter = { urls: ['<all_urls>'], types: ['xmlhttprequest'] };
+  try {
+    browser.webRequest.onBeforeSendHeaders.addListener(
+      injectRefererHeaders,
+      filter,
+      ['blocking', 'requestHeaders', 'extraHeaders']
+    );
+  }
+  catch (error) {
+    browser.webRequest.onBeforeSendHeaders.addListener(
+      injectRefererHeaders,
+      filter,
+      ['blocking', 'requestHeaders']
+    );
+  }
+}
+
 TurndownService.prototype.defaultEscape = TurndownService.prototype.escape;
 
 // function to convert the article content to markdown using Turndown
@@ -323,6 +388,7 @@ async function convertArticleToMarkdown(article, downloadImages = null) {
     options.downloadImages = downloadImages;
   }
 
+
   // substitute front and backmatter templates if necessary
   if (options.includeTemplate) {
     options.frontmatter = textReplace(options.frontmatter, article) + '\n';
@@ -341,7 +407,7 @@ async function convertArticleToMarkdown(article, downloadImages = null) {
   let result = turndown(article.content, options, article);
   if (options.downloadImages && options.downloadMode == 'downloadsApi') {
     // pre-download the images
-    result = await preDownloadImages(result.imageList, result.markdown);
+    result = await preDownloadImages(result.imageList, result.markdown, article.baseURI);
   }
   return result;
 }
@@ -369,7 +435,7 @@ function generateValidFileName(title, disallowedChars = null) {
   return name;
 }
 
-async function preDownloadImages(imageList, markdown) {
+async function preDownloadImages(imageList, markdown, pageUrl = null) {
   const options = await getOptions();
   let newImageList = {};
   // originally, I was downloading the markdown file first, then all the images
@@ -379,12 +445,41 @@ async function preDownloadImages(imageList, markdown) {
   await Promise.all(Object.entries(imageList).map(([src, filename]) => new Promise((resolve, reject) => {
         // we're doing an xhr so we can get it as a blob and determine filetype
         // before the final save
+        const shouldInjectReferer = !!pageUrl && /^https?:/i.test(src);
+        if (shouldInjectReferer) registerImageRequestReferer(src, pageUrl);
+
+        const cleanupReferer = () => {
+          if (shouldInjectReferer) unregisterImageRequestReferer(src);
+        };
+
         const xhr = new XMLHttpRequest();
         xhr.open('GET', src);
         xhr.responseType = "blob";
         xhr.onload = async function () {
+          cleanupReferer();
+
+          const status = xhr.status;
           // here's the returned blob
           const blob = xhr.response;
+          const blobType = (blob?.type || '').toLowerCase();
+          const isSuccessStatus = (status >= 200 && status < 300) || status === 0;
+          const isLikelyErrorDocument =
+            blobType.includes('xml') ||
+            blobType.includes('html') ||
+            blobType.includes('json') ||
+            blobType.startsWith('text/');
+
+          if (!isSuccessStatus) {
+            reject('An HTTP error occurred attempting to download ' + src + ': ' + status);
+            return;
+          }
+
+          // Some anti-hotlink/CDN responses return XML/HTML payloads with 2xx.
+          // Reject these so they are never saved as fake image files.
+          if (isLikelyErrorDocument) {
+            reject('A non-image response was returned for ' + src + ': ' + (blobType || 'unknown'));
+            return;
+          }
 
           if (options.imageStyle == 'base64') {
             var reader = new FileReader();
@@ -419,7 +514,7 @@ async function preDownloadImages(imageList, markdown) {
                 applyFilenameUpdate(newFilename.replace('.idunno', '.' + mimeExt));
               }
               else if (currentExt && currentExt.toLowerCase() !== mimeExt.toLowerCase()) {
-                applyFilenameUpdate(`${newFilename.substring(0, extStart + 1)}${mimeExt}`);
+                applyFilenameUpdate(newFilename.substring(0, extStart + 1) + mimeExt);
               }
             }
 
@@ -435,6 +530,7 @@ async function preDownloadImages(imageList, markdown) {
           }
         };
         xhr.onerror = function () {
+          cleanupReferer();
           reject('A network error occurred attempting to download ' + src);
         };
         xhr.send();
