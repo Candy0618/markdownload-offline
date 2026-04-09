@@ -435,6 +435,53 @@ function generateValidFileName(title, disallowedChars = null) {
   return name;
 }
 
+function replaceImageUrlsInMarkdownPreserveCodeFences(markdown, fromUrl, toUrl) {
+  if (!fromUrl || fromUrl === toUrl) return markdown;
+
+  const escapeForRegex = (value) => value.replace(/[-\/\^$*+?.()|[\]{}]/g, "\\$&");
+  const escapedFrom = escapeForRegex(fromUrl);
+  const inlineImageRegex = new RegExp("(!\\[[^\\]]*\\]\\()" + escapedFrom + "(\\))", "g");
+  const referenceImageRegex = new RegExp("(^\\s*\\[[^\\]]+\\]:\\s*)" + escapedFrom + "(?=(?:\\s|$))", "gm");
+  const htmlImgRegex = new RegExp("(<img\\b[^>]*\\bsrc=[\"'])" + escapedFrom + "([\"'][^>]*>)", "gi");
+
+  const lines = markdown.split("\n");
+  let inFence = false;
+  let fenceMarker = "";
+  let fenceLen = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trimStart();
+    const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0];
+      const len = fenceMatch[1].length;
+
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker;
+        fenceLen = len;
+      }
+      else if (marker === fenceMarker && len >= fenceLen) {
+        inFence = false;
+        fenceMarker = "";
+        fenceLen = 0;
+      }
+
+      continue;
+    }
+
+    if (inFence) continue;
+
+    lines[i] = line
+      .replace(inlineImageRegex, "$1" + toUrl + "$2")
+      .replace(referenceImageRegex, "$1" + toUrl)
+      .replace(htmlImgRegex, "$1" + toUrl + "$2");
+  }
+
+  return lines.join("\n");
+}
 async function preDownloadImages(imageList, markdown, pageUrl = null) {
   const options = await getOptions();
   let newImageList = {};
@@ -470,21 +517,23 @@ async function preDownloadImages(imageList, markdown, pageUrl = null) {
             blobType.startsWith('text/');
 
           if (!isSuccessStatus) {
-            reject('An HTTP error occurred attempting to download ' + src + ': ' + status);
+            console.warn('An HTTP error occurred attempting to download ' + src + ': ' + status);
+            resolve();
             return;
           }
 
           // Some anti-hotlink/CDN responses return XML/HTML payloads with 2xx.
           // Reject these so they are never saved as fake image files.
           if (isLikelyErrorDocument) {
-            reject('A non-image response was returned for ' + src + ': ' + (blobType || 'unknown'));
+            console.warn('A non-image response was returned for ' + src + ': ' + (blobType || 'unknown'));
+            resolve();
             return;
           }
 
           if (options.imageStyle == 'base64') {
             var reader = new FileReader();
             reader.onloadend = function () {
-              markdown = markdown.replaceAll(src, reader.result)
+              markdown = replaceImageUrlsInMarkdownPreserveCodeFences(markdown, src, reader.result)
               resolve()
             }
             reader.readAsDataURL(blob);
@@ -494,13 +543,12 @@ async function preDownloadImages(imageList, markdown, pageUrl = null) {
             let newFilename = filename;
             const applyFilenameUpdate = (updatedFilename) => {
               if (!options.imageStyle.startsWith("obsidian")) {
-                markdown = markdown.replaceAll(
-                  newFilename.split('/').map(s => encodeURI(s)).join('/'),
-                  updatedFilename.split('/').map(s => encodeURI(s)).join('/')
-                );
+                const currentRef = newFilename.split('/').map(s => encodeURI(s)).join('/');
+                const updatedRef = updatedFilename.split('/').map(s => encodeURI(s)).join('/');
+                markdown = replaceImageUrlsInMarkdownPreserveCodeFences(markdown, currentRef, updatedRef);
               }
               else {
-                markdown = markdown.replaceAll(newFilename, updatedFilename);
+                markdown = replaceImageUrlsInMarkdownPreserveCodeFences(markdown, newFilename, updatedFilename);
               }
               newFilename = updatedFilename;
             };
@@ -531,7 +579,8 @@ async function preDownloadImages(imageList, markdown, pageUrl = null) {
         };
         xhr.onerror = function () {
           cleanupReferer();
-          reject('A network error occurred attempting to download ' + src);
+          console.warn('A network error occurred attempting to download ' + src);
+          resolve();
         };
         xhr.send();
   })));
